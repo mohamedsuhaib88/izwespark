@@ -1,0 +1,361 @@
+Target Audience: Aspiring Spark developers from Data warehousing background
+	
+ 
+Contents
+Using Timestamp Datatype:	2
+Implementing SCD2	4
+Pivoting	12
+Retrieving top 2 values from each field	13
+Window Function	14
+Explode function to split a String Column	16
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Using Timestamp Datatype:
+
+scala> :paste
+// Entering paste mode (ctrl-D to finish)
+import org.apache.spark.sql.functions.{current_date, current_timestamp}
+valdateDF = sqlContext.range(10)
+.withColumn("today", current_date())
+.withColumn("now", current_timestamp())
+dateDF.show
+
+ 
+
+dateDF.withColumn("Year",year(dateDF("today"))).show
+dateDF.withColumn("Week",weekofyear(dateDF("today"))).show
+dateDF.withColumn("Month",month(dateDF("today"))).show
+dateDF.withColumn("Month",dayofmonth(dateDF("today"))).show
+dateDF.withColumn("cur_minute",minute(col("now"))).show
+dateDF.withColumn("cur_second",second(col("now"))).show
+dateDF.withColumn("new_added_months_date", expr("add_months(today, 7)")).show
+
+Useful Date functions with Dataframes:
+Function	Description
+date_sub	To subtract specific number of days from a give date
+date_add	To add specific number of days from a give date
+datediff	To subtract two dates
+months_between	To find the number of months between two dates
+to_date	To conver a string literal to a date
+year	To extract year from date
+weekofyear	To extract week of year
+month	To extract month from date
+dayofmonth	To extract day of month
+minute	To extract minute from timestamp
+second	To extract second from timestamp
+add_months	To add months to date
+
+To change the date format:
+valdateFormat = "yyyy-dd-MM"
+sqlContext.range(1).select(
+to_date(from_unixtime(unix_timestamp(lit("20171211"), "yyyyMMdd"), dateFormat)).alias("date")).show
+
+
+
+
+
+
+
+
+
+
+
+
+
+Implementing SCD2
+
+Initial load:
+// brief description about steps followed to build SCD2.
+// 1. yelp_data_actHist = Active records from History file which are not found in current file.
+// 2. yelp_data_intersect = Active records from History file for which there are no updates in current file (same record is available).
+// 3. yelp_data_expired = Inactive records from History file.
+// 4. yelp_data_upnew_date = Set of Updated and new records from current file.
+// 5. yelp_data_upexp_date = End date updated records from history as the updates found for them in current file.
+
+InputFile:
+hadoop fs -cat yelp_user_20190129.csv
+user_id,name,yelping_since,useful,elite,average_stars
+zzNKg1,Jenna,2011-12-20,0,None,5.0
+zzNKg2,Jenna,2011-12-20,2500,2015 2016 2017,4.5
+zzNKg3,Jenna,2011-12-20,3000,2015 2016 2018,3.5
+zzNKg4,Jenna,2011-12-20,3400,2015 2017 2018,4.0
+
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.hadoop.fs._
+import org.apache.spark.sql._
+import org.apache.spark.sql.functions._
+import scala.io.Source
+import java.text.SimpleDateFormat
+
+valproc_dt = "20190129"
+valinputFormat = new SimpleDateFormat("yyyyMMdd")
+valreqFormat = new SimpleDateFormat("yyyy-MM-dd")
+// Convert the effective and expiry date in yyyy-MM-dd format    
+valeff_dt = reqFormat.format(inputFormat.parse(proc_dt))
+valexp_dt = reqFormat.format(reqFormat.parse("9999-12-31"))    
+valhistPath = new Path("/user/respond474/yelp_hist/")
+valhistTabPath= "/user/respond474/yelp_hist/"
+valinput_file = s"/user/respond474/yelp_user_20190129.csv"
+val fs = FileSystem.get(sc.hadoopConfiguration)
+sqlContext.setConf("spark.sql.shuffle.partitions", "10")
+import sqlContext.implicits._
+
+// Check if the HIST table directory present for first run, else create directory    
+if (!fs.exists(histPath)) {
+println("History table directory does not exist, creating directory")
+fs.mkdirs(histPath)
+
+} else {
+println("History table directory exist")
+        }
+				
+valyelp_data = sqlContext.read.format("com.databricks.spark.csv").
+option("header", "true").
+option("inferSchema", "true").
+option("quote", "\"").
+               load(input_file)
+
+ 									
+valyelp_data_hist = yelp_data.withColumn("eff_dt",to_date(from_unixtime(unix_timestamp(lit(eff_dt),"yyyy-MM-dd"), "yyyy-MM-dd"))).withColumn("exp_dt",to_date(from_unixtime(unix_timestamp(lit(exp_dt),"yyyy-MM-dd"), "yyyy-MM-dd")))
+
+import org.apache.spark.sql.SaveMode
+yelp_data_hist.coalesce(2).write.mode(SaveMode.Overwrite).format("orc").saveAsTable("respond474.yelp_hist")
+
+ 
+
+Incremental load:
+
+hadoop fs -cat yelp_user_20190130.csv
+user_id,name,yelping_since,useful,elite,average_stars
+zzNKg1,Jenna,2011-12-20,3400,2015 2018 2018,8.0
+BBBBB1,Jenna,2011-12-20,3400,2015 2018 2018,12.0
+
+valstgPath = new Path("/user/respond474/yelp_hist_stg/")
+valhistPath = new Path("/apps/hive/warehouse/respond474.db/yelp_hist")
+valhistTabPath = "/apps/hive/warehouse/respond474.db/yelp_hist"
+valstgTabPath = "/user/respond474/yelp_hist_stg/"
+valinput_file = s"/user/respond474/yelp_user_20190130.csv"
+valyelp_data_stg = sqlContext.read.format("com.databricks.spark.csv").
+option("header", "true").
+option("inferSchema", "true").
+option("quote", "\"").
+                                    load(input_file)								
+ 
+
+valyelp_data_hist = sqlContext.read.orc(histTabPath)
+yelp_data_hist.cache
+valyelp_data_expired = yelp_data_hist.as("hist").filter($"exp_dt" !== "9999-12-31").select($"hist.*")
+
+valyelp_data_intersect = yelp_data_hist.as("hist").filter($"exp_dt"==="9999-12-31").
+join(yelp_data_stg.as("stg"), Seq("user_id"), "inner").
+where($"hist.exp_dt" === "9999-12-31" 
+&& $"hist.useful" === $"stg.useful" 
+&& $"hist.average_stars" === $"stg.average_stars" 
+&& $"hist.yelping_since" === $"stg.yelping_since" 
+&& $"hist.name" === $"stg.name" 
+&& $"hist.elite" === $"stg.elite"). select($"hist.*")
+
+
+//New or updated records
+valyelp_data_upnew = yelp_data_stg.as("stg").
+join(yelp_data_hist.as("hist").filter($"exp_dt"==="9999-12-31"), $"hist.user_id" === $"stg.user_id", "left").
+where(
+($"hist.user_id".isNull) || 
+($"hist.user_id" === $"stg.user_id"  &&
+(($"hist.useful" !== $"stg.useful" ) ||  
+($"hist.yelping_since" !== $"stg.yelping_since" ) || 
+($"hist.name" !== $"stg.name" ) || 
+($"hist.average_stars" !== $"stg.average_stars") 
+))).select($"stg.*")
+
+valyelp_data_upnew.show()
+ 
+
+valyelp_data_upnew_date = yelp_data_upnew.withColumn("eff_dt",to_date(from_unixtime(unix_timestamp(lit(eff_dt), "yyyy-MM-dd"), "yyyy-MM-dd"))).
+                                  withColumn("exp_dt",to_date(from_unixtime(unix_timestamp(lit("9999-12-31"),"yyyy-MM-dd"), "yyyy-MM-dd")))
+ 
+
+
+										
+// Get old updated user_id from the HIST table and set expiry date i.e. (2099-12-31)
+valyelp_data_upexp = yelp_data_hist.as("hist").filter($"exp_dt"==="9999-12-31").
+join(yelp_data_stg.as("stg"), Seq("user_id"), "inner").
+where(
+($"hist.useful" !== $"stg.useful" ) ||   
+($"hist.yelping_since" !== $"stg.yelping_since" ) || 
+($"hist.name" !== $"stg.name" ) || 
+($"hist.average_stars" !== $"stg.average_stars")  
+).select($"hist.*")
+
+ 
+
+valyelp_data_upexp_date = yelp_data_upexp.withColumn("exp_dt",to_date(from_unixtime(unix_timestamp(lit(exp_dt),"yyyy-MM-dd"), "yyyy-MM-dd")))
+ 
+
+// Active user_id from the HIST table that are not in STG
+valyelp_data_actHist = yelp_data_hist.as("hist").filter($"exp_dt"==="9999-12-31").
+join(yelp_data_stg.as("stg"), $"hist.user_id" === $"stg.user_id", "left").
+where( $"stg.user_id".isNull).select($"hist.*") 
+// Merge data from all the above dataframes to create historical table data								
+valdfUnion = Seq(yelp_data_actHist,yelp_data_intersect,yelp_data_expired,yelp_data_upnew_date,yelp_data_upexp_date)
+
+valyelp_data_all = dfUnion.reduce(_.unionAll(_))	
+ 	
+yelp_data_all.write.mode(SaveMode.Overwrite).format("orc").save(stgTabPath)
+yelp_data_all.cache
+
+if (fs.exists(histPath)) {
+println("History table directory exist, deleting the old table data")
+fs.delete(histPath)
+    } else {
+println("History table directory does not exist")
+            }
+
+    if (fs.exists(stgPath)) {
+println("Staging directory is loaded with updated data, ")
+fs.rename(stgPath,histPath)
+    } else {
+println("Staging directorydoes not exist")
+            }
+
+ 
+Pivoting
+
+Input file [pivot_input.csv]
+id,tag,value
+1,US,50
+1,UK,100
+1,Can,125
+2,US,75
+2,UK,150
+2,Can,175
+
+valinputDF = sqlContext.read.format("com.databricks.spark.csv").
+option("header", "true").
+option("inferSchema", "true").
+                                    load("pivot_input.csv")
+inputDF.groupBy("id").pivot("tag").agg(sum("value")).show
+
+ 
+
+Retrieving top 2 values from each field
+
+input_file(mixName.txt):
+mixname,soda,formula1,formula2,formula3
+m1,10,1.5,2.5,3.4
+m2,20,1.3,2.3,3.1
+m3,15,1.8,2.9,3.0
+m4,12,1.1,2.1,3.9
+Steps to transform input as below:
+ 
+
+valdf = sc.textFile("/user/respond474/mixName.txt").filter(x=> (x.split(",")(1) != "soda")).map(x => {val v = x.split(","); (v(0), v(1).toDouble, v(2).toDouble, v(3).toDouble, v(4).toDouble)}).toDF("mixname","soda","formula1","formula2","formula3")
+valrowLength = df.schema.length
+valrankRDD = df.flatMap( row => Range(1, rowLength).map(i => (i, row.getDouble(i))))
+valrankSorted = rankRDD.groupByKey.map(x => (x._1, x._2.toArray.sortWith(_>_))).sortByKey(true)
+valfinal_res = rankSorted.map(x => (x._1, x._2.zipWithIndex)).map(row => (row._1, Range(0, 2).map(i => row._2(i)).map(x=> x._1).toList))
+val header = sc.textFile("/user/respond474/mixName.txt").first.split(",")
+val final_res_1 = final_res.map(row => (header(row._1), row._1, row._2))
+Window Function
+
+case class Salary(depName: String, empNo: Long, salary: Long)
+valempsalary = Seq(
+Salary("sales", 1, 5000),
+Salary("personnel", 2, 3900),
+Salary("sales", 3, 4800),
+Salary("sales", 4, 4800),
+Salary("personnel", 5, 3500),
+Salary("develop", 7, 4200),
+Salary("develop", 8, 6000),
+Salary("develop", 9, 4500),
+Salary("develop", 10, 5200),
+Salary("develop", 11, 5200)).toDF
+
+ 
+
+  import org.apache.spark.sql.expressions.Window
+valbyDepName = Window.partitionBy('depName)
+empsalary.withColumn("avg", avg('salary) over byDepName).show
+
+ 
+
+/////////////////////////////////////////////////////////////////////
+
+valbyDepnameSalaryDesc = Window.partitionBy('depname).orderBy('salary desc)
+valrankByDepname = rank().over(byDepnameSalaryDesc)
+empsalary.select('*, rankByDepname as 'rank).show
+
+ 
+
+//////////////////////////////////////////////////////////////////////
+
+valpartitionWindow = Window.partitionBy($"depname").orderBy($"salary".desc).rowsBetween(1,1)
+
+The window frame is defined as starting from 1 (one row after the current row) and ending at 1 (one row after the current row)
+Preceding row can be indicated as -1 (one row before the current row)
+
+valnext_val = max($"salary").over(partitionWindow)
+empsalary.select($"*", next_val as 'nextSalary).show
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+Explode function to split a String Column
+
+Input file(child_parent.txt):
+P1|C1,C2,C3
+P2|A1,A2,A3
+P3|B1,B2,B3
+
+valdf = sc.textFile("/user/respond474/child_parent.txt").map(x => (x.split('|')(0),x.split('|')(1))).toDF("Parent", "Child")
+ 
+
+df.withColumn("splitted", split(col("Child"), ",")).withColumn("exploded", explode(col("splitted"))).drop(col("splitted")).show
+
+ 
+
+It is also possible to add depth using spark-sql.
+val df1 = df.withColumn("splitted", split(col("Child"), ","))
+df1.registerTempTable("df_tab")
+sqlContext.sql("""
+    select 
+       Parent, Child, exploded.dIndex + 1 as depth, exploded.splitted
+    from 
+df_tab
+    lateral view posexplode(df_tab.splitted) exploded as dIndex, splitted
+""").show
+
+ 
+
+
+
